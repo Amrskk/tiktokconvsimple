@@ -20,7 +20,7 @@ MAX_MB = float(os.getenv("MAX_MB", "2000"))
 
 # TikTok URL detector
 TT_REGEX = re.compile(
-    r"(https?://(?:www\.)?tiktok\.com/[^\s]+|https?://vt\.tiktok\.com/[^\s]+)",
+    r"(https?://(?:(?:www|vt|vm|m)\.)?tiktok\.com/[^\s]+)",
     re.IGNORECASE,
 )
 
