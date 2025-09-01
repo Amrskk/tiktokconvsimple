@@ -125,7 +125,6 @@ def run_gallery_dl(url: str, out_dir: Path) -> subprocess.CompletedProcess:
         sys.executable, "-m", "gallery_dl",
         "--quiet",
         "-d", str(out_dir),
-        "--http-header", f"User-Agent={UA}",
     ]
     if COOKIES and Path(COOKIES).exists():
         cmd.extend(["--cookies", COOKIES])
