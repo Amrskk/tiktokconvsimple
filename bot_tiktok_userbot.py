@@ -12,6 +12,7 @@ import subprocess
 import asyncio
 from typing import List, Iterable
 import shutil
+import sys
 
 load_dotenv()
 
@@ -120,7 +121,12 @@ def is_slideshow_from_info(info: dict) -> bool:
     return (duration in (None, 0)) and (len(thumbs) >= 2)
 
 def run_gallery_dl(url: str, out_dir: Path) -> subprocess.CompletedProcess:
-    cmd = ["python3", "-m", "gallery_dl", "--quiet", "-d", str(out_dir), "--http-header", f"User-Agent={UA}"]
+    cmd = [
+        sys.executable, "-m", "gallery_dl",
+        "--quiet",
+        "-d", str(out_dir),
+        "--http-header", f"User-Agent={UA}",
+    ]
     if COOKIES and Path(COOKIES).exists():
         cmd.extend(["--cookies", COOKIES])
     cmd.append(url)
