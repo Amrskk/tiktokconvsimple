@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 from contextlib import asynccontextmanager
-
+from urllib.parse import urlsplit, urlunsplit
 from telethon import TelegramClient, events
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 from yt_dlp import YoutubeDL
@@ -23,6 +23,7 @@ ALLOWED = {x.strip().lower() for x in os.getenv("ALLOWED_CHATS", "").split(",") 
 COOKIES = os.getenv("TIKTOK_COOKIES")
 MAX_MB = float(os.getenv("MAX_MB", "2000"))  # per-file cap for sending
 AUTO_CLEAN = os.getenv("AUTO_CLEAN", "true").strip().lower() not in {"0", "false", "no"}
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # TikTok URL detector
 TT_REGEX = re.compile(
@@ -34,6 +35,9 @@ DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ---------- Helpers ----------
+def normalize_tiktok_url(u: str) -> str:
+    parts = urlsplit(u)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip('/'), "", ""))
 
 def ydl_opts_for(url: str, target: Path | None) -> dict:
     """Opts for yt-dlp (probe if target=None; download if target is file path)."""
@@ -41,6 +45,7 @@ def ydl_opts_for(url: str, target: Path | None) -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "http_headers": {"User-Agent": UA},
     }
     if target is not None:
         opts.update({
@@ -94,15 +99,13 @@ def chat_is_allowed(event: events.NewMessage.Event) -> bool:
 # ---------- Core: detect + download ----------
 
 def probe_tiktok(url: str) -> dict:
-    """
-    Probe TikTok with yt-dlp (no download). Returns info dict (may contain _probe_error).
-    """
     try:
         with YoutubeDL(ydl_opts_for(url, None)) as ydl:
             info = ydl.extract_info(url, download=False)
             return info or {}
     except Exception as e:
-        return {"_probe_error": str(e)}
+        msg = str(e)
+        return {"_probe_error": msg, "_unsupported": ("Unsupported URL" in msg) or ("RegexMatchError" in msg)}
 
 def is_slideshow_from_info(info: dict) -> bool:
     if not info or "_probe_error" in info:
@@ -117,12 +120,8 @@ def is_slideshow_from_info(info: dict) -> bool:
     return (duration in (None, 0)) and (len(thumbs) >= 2)
 
 def run_gallery_dl(url: str, out_dir: Path) -> subprocess.CompletedProcess:
-    """
-    Use gallery-dl to download images for Photo Mode posts.
-    """
-    cmd = ["python", "-m", "gallery_dl", "--quiet", "-d", str(out_dir)]
+    cmd = ["python", "-m", "gallery_dl", "--quiet", "-d", str(out_dir), "--http-header", f"User-Agent={UA}"]
     if COOKIES and Path(COOKIES).exists():
-        # gallery-dl can use Netscape cookie file via --cookies
         cmd.extend(["--cookies", COOKIES])
     cmd.append(url)
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -184,7 +183,8 @@ async def tiktok_handler(event: events.NewMessage.Event):
     if not match:
         return
 
-    url = match.group(0)
+    raw_url = match.group(0)
+    url = normalize_tiktok_url(raw_url)
     reply = await event.reply(f"Сканирую твою ссылку..(звучит круто да):\n{url}")
 
     base = DOWNLOAD_DIR / f"tt_{event.id}"
@@ -198,7 +198,8 @@ async def tiktok_handler(event: events.NewMessage.Event):
     try:
         info = probe_tiktok(url)
         slideshow = is_slideshow_from_info(info)
-
+        if info.get("_unsupported"):
+            slideshow = True
         if slideshow:
             await reply.edit("А блин бро тут картинки, ща скачаю тогда")
             proc = run_gallery_dl(url, slide_dir)
