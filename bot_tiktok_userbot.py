@@ -22,6 +22,7 @@ ONLY_PRIVATE = os.getenv("ONLY_PRIVATE", "true").strip().lower() not in {"0", "f
 ALLOWED = {x.strip().lower() for x in os.getenv("ALLOWED_CHATS", "").split(",") if x.strip()}
 COOKIES = os.getenv("TIKTOK_COOKIES")
 MAX_MB = float(os.getenv("MAX_MB", "2000"))  # per-file cap for sending
+AUTO_CLEAN = os.getenv("AUTO_CLEAN", "true").strip().lower() not in {"0", "false", "no"}
 
 # TikTok URL detector
 TT_REGEX = re.compile(
@@ -160,7 +161,7 @@ def safe_unlink(p: Path):
 def clean_video_files(files: Iterable[Path]):
     for p in files:
         safe_unlink(p)
-    # also remove common leftover fragments
+    # remove possible partial fragments
     for p in files:
         for frag in p.parent.glob(p.stem + ".*.part"):
             safe_unlink(frag)
@@ -186,11 +187,13 @@ async def tiktok_handler(event: events.NewMessage.Event):
     url = match.group(0)
     reply = await event.reply(f"Сканирую твою ссылку..(звучит круто да):\n{url}")
 
-    
     base = DOWNLOAD_DIR / f"tt_{event.id}"
     tmp_mp4 = base.with_suffix(".mp4")
     slide_dir = base.with_suffix("")  # folder for slideshow images
     slide_dir.mkdir(exist_ok=True)
+
+    success_video = False
+    success_slideshow = False
 
     try:
         info = probe_tiktok(url)
@@ -206,7 +209,7 @@ async def tiktok_handler(event: events.NewMessage.Event):
 
             imgs = collect_images(slide_dir)
             if not imgs:
-                await reply.edit("Лол че за хуня хахсхсхахвха, не нашлось картинок.")
+                await reply.edit("Лол че за хуня хахсхсхахвха, не нашлось картинок")
                 return
 
             # Filter by size limit per file
@@ -226,18 +229,25 @@ async def tiktok_handler(event: events.NewMessage.Event):
                 return
 
             await reply.edit(
-                f"На тебе {len(filtered)} изображений" + (f" (пропущено {skipped} из-за размера)" if skipped else "") + "…"
+                f"На те {len(filtered)} картинок"
+                + (f" (пропущено {skipped} из-за размера)" if skipped else "")
+                + "…"
             )
             await send_in_albums(
                 event.chat_id,
                 filtered,
-                caption_head=f"мяу • {len(filtered)} картиночеккк",
+                caption_head=f"мяу {len(filtered)} картинононок",
                 per_album=10,
             )
             await reply.delete()
+            success_slideshow = True
+
+            # Auto-clean slideshow images after successful send
+            if AUTO_CLEAN:
+                clean_slideshow_dir(slide_dir)
             return
 
-        # 2) Otherwise treat as a normal video
+        # Otherwise treat as a normal video
         await reply.edit("качаю тикток видос жди говнюк")
         with YoutubeDL(ydl_opts_for(url, tmp_mp4)) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -247,25 +257,32 @@ async def tiktok_handler(event: events.NewMessage.Event):
                 tmp_mp4 = final_path
 
         if not tmp_mp4.exists():
-            await reply.edit("Че за видос ты мне скинул, не скачался.")
+            await reply.edit("Че за видос ты мне скинул, не скачался")
             return
 
         size_mb = human_mb(tmp_mp4.stat().st_size)
         if size_mb > MAX_MB:
             await reply.edit(f"Файл слишком большой ({size_mb} MB > {MAX_MB} MB).")
-            tmp_mp4.unlink(missing_ok=True)
+            safe_unlink(tmp_mp4)
             return
 
         await reply.edit("На те видео лол")
-        await event.respond(file=str(tmp_mp4), caption=f" {size_mb} MB")
+        await client.send_file(event.chat_id, file=str(tmp_mp4), caption=f"видос {size_mb} MB")
         await reply.delete()
+        success_video = True
+
+        # Auto-clean video file after successful send
+        if AUTO_CLEAN:
+            clean_video_files([tmp_mp4])
 
     except Exception as e:
         await reply.edit(f"Ошибка: {e}")
     finally:
-        # Clean up only the temp video; keep images so you can inspect if needed.
         try:
-            tmp_mp4.unlink(missing_ok=True)
+            if AUTO_CLEAN:
+                clean_video_files([tmp_mp4])
+            else:
+                safe_unlink(tmp_mp4)
         except Exception:
             pass
 
