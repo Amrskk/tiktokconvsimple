@@ -7,6 +7,11 @@ from telethon import TelegramClient, events
 from telethon.tl.types import PeerUser, PeerChannel, PeerChat
 from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
+import json
+import subprocess
+import asyncio
+from typing import List, Iterable
+import shutil
 
 load_dotenv()
 
@@ -16,7 +21,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "tiktok_userbot")
 ONLY_PRIVATE = os.getenv("ONLY_PRIVATE", "true").strip().lower() not in {"0", "false", "no"}
 ALLOWED = {x.strip().lower() for x in os.getenv("ALLOWED_CHATS", "").split(",") if x.strip()}
 COOKIES = os.getenv("TIKTOK_COOKIES")
-MAX_MB = float(os.getenv("MAX_MB", "2000"))  
+MAX_MB = float(os.getenv("MAX_MB", "2000"))  # per-file cap for sending
 
 # TikTok URL detector
 TT_REGEX = re.compile(
@@ -27,15 +32,21 @@ TT_REGEX = re.compile(
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-def ydl_opts_for(url: str, target: Path) -> dict:
+# ---------- Helpers ----------
+
+def ydl_opts_for(url: str, target: Path | None) -> dict:
+    """Opts for yt-dlp (probe if target=None; download if target is file path)."""
     opts = {
-        "outtmpl": str(target),        # exact file path
         "noplaylist": True,
-        "format": "mp4/bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
     }
+    if target is not None:
+        opts.update({
+            "outtmpl": str(target),
+            "format": "mp4/bestvideo+bestaudio/best",
+            "merge_output_format": "mp4",
+        })
     if COOKIES and Path(COOKIES).exists():
         opts["cookiefile"] = COOKIES
     return opts
@@ -79,6 +90,89 @@ def chat_is_allowed(event: events.NewMessage.Event) -> bool:
     key = _chat_key(event)
     return key is not None and key.lower() in ALLOWED
 
+# ---------- Core: detect + download ----------
+
+def probe_tiktok(url: str) -> dict:
+    """
+    Probe TikTok with yt-dlp (no download). Returns info dict (may contain _probe_error).
+    """
+    try:
+        with YoutubeDL(ydl_opts_for(url, None)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info or {}
+    except Exception as e:
+        return {"_probe_error": str(e)}
+
+def is_slideshow_from_info(info: dict) -> bool:
+    if not info or "_probe_error" in info:
+        return False
+    duration = info.get("duration", None)
+    thumbs = info.get("thumbnails") or []
+    # If we see multiple images in "entries" (playlist-like), treat as slideshow
+    entries = info.get("entries") or []
+    if entries and all(isinstance(x, dict) for x in entries):
+        # Some TikTok photo posts expose multiple items
+        return True
+    return (duration in (None, 0)) and (len(thumbs) >= 2)
+
+def run_gallery_dl(url: str, out_dir: Path) -> subprocess.CompletedProcess:
+    """
+    Use gallery-dl to download images for Photo Mode posts.
+    """
+    cmd = ["python", "-m", "gallery_dl", "--quiet", "-d", str(out_dir)]
+    if COOKIES and Path(COOKIES).exists():
+        # gallery-dl can use Netscape cookie file via --cookies
+        cmd.extend(["--cookies", COOKIES])
+    cmd.append(url)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+def collect_images(dir_path: Path) -> List[Path]:
+    """
+    Collect images (common formats) from a dir, sorted by natural name.
+    """
+    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+    imgs = [p for p in dir_path.rglob("*") if p.suffix.lower() in exts and p.is_file()]
+    # Sort by path for stable order
+    imgs.sort(key=lambda p: str(p))
+    return imgs
+
+async def send_in_albums(
+    chat_id,
+    files: List[Path],
+    caption_head: str,
+    per_album: int = 10,
+):
+    """
+    Send images in Telegram albums (max 10 per album).
+    """
+    # First album carries the caption; next ones have no caption to avoid repetition
+    for i in range(0, len(files), per_album):
+        batch = files[i:i + per_album]
+        cap = caption_head if i == 0 else None
+        await client.send_file(chat_id, [str(x) for x in batch], caption=cap)
+
+def safe_unlink(p: Path):
+    try:
+        p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+def clean_video_files(files: Iterable[Path]):
+    for p in files:
+        safe_unlink(p)
+    # also remove common leftover fragments
+    for p in files:
+        for frag in p.parent.glob(p.stem + ".*.part"):
+            safe_unlink(frag)
+
+def clean_slideshow_dir(dir_path: Path):
+    try:
+        shutil.rmtree(dir_path, ignore_errors=True)
+    except Exception:
+        pass
+
+# ---------- Handler ----------
+
 @client.on(events.NewMessage(pattern=TT_REGEX))
 async def tiktok_handler(event: events.NewMessage.Event):
     if not chat_is_allowed(event):
@@ -90,13 +184,61 @@ async def tiktok_handler(event: events.NewMessage.Event):
         return
 
     url = match.group(0)
-    reply = await event.reply(f" Обрабатываю ссылку:\n{url}")
+    reply = await event.reply(f"Сканирую твою ссылку..(звучит круто да):\n{url}")
 
-    # Unique filename per task
+    
     base = DOWNLOAD_DIR / f"tt_{event.id}"
     tmp_mp4 = base.with_suffix(".mp4")
+    slide_dir = base.with_suffix("")  # folder for slideshow images
+    slide_dir.mkdir(exist_ok=True)
 
     try:
+        info = probe_tiktok(url)
+        slideshow = is_slideshow_from_info(info)
+
+        if slideshow:
+            await reply.edit("А блин бро тут картинки, ща скачаю тогда")
+            proc = run_gallery_dl(url, slide_dir)
+            if proc.returncode != 0:
+                err = proc.stderr.strip() or proc.stdout.strip()
+                await reply.edit(f"Не получилось бро сорян (gallery-dl): {err[:500]}")
+                return
+
+            imgs = collect_images(slide_dir)
+            if not imgs:
+                await reply.edit("Лол че за хуня хахсхсхахвха, не нашлось картинок.")
+                return
+
+            # Filter by size limit per file
+            filtered = []
+            skipped = 0
+            for p in imgs:
+                size_mb = human_mb(p.stat().st_size)
+                if size_mb <= MAX_MB:
+                    filtered.append(p)
+                else:
+                    skipped += 1
+
+            if not filtered:
+                await reply.edit(
+                    f"Все изображения превышают лимит {MAX_MB} MB на файл. Нечего отправлять."
+                )
+                return
+
+            await reply.edit(
+                f"На тебе {len(filtered)} изображений" + (f" (пропущено {skipped} из-за размера)" if skipped else "") + "…"
+            )
+            await send_in_albums(
+                event.chat_id,
+                filtered,
+                caption_head=f"мяу • {len(filtered)} картиночеккк",
+                per_album=10,
+            )
+            await reply.delete()
+            return
+
+        # 2) Otherwise treat as a normal video
+        await reply.edit("качаю тикток видос жди говнюк")
         with YoutubeDL(ydl_opts_for(url, tmp_mp4)) as ydl:
             info = ydl.extract_info(url, download=True)
             # If yt-dlp changed the filename, use its final name
@@ -105,35 +247,29 @@ async def tiktok_handler(event: events.NewMessage.Event):
                 tmp_mp4 = final_path
 
         if not tmp_mp4.exists():
-            await reply.edit(" Не удалось скачать видео.")
+            await reply.edit("Че за видос ты мне скинул, не скачался.")
             return
 
         size_mb = human_mb(tmp_mp4.stat().st_size)
         if size_mb > MAX_MB:
-            await reply.edit(f" Файл слишком большой ({size_mb} MB > {MAX_MB} MB).")
+            await reply.edit(f"Файл слишком большой ({size_mb} MB > {MAX_MB} MB).")
             tmp_mp4.unlink(missing_ok=True)
             return
 
-        await reply.edit("Отправляю видео…")
-        await event.respond(file=str(tmp_mp4), caption=f" TikTok • {size_mb} MB")
+        await reply.edit("На те видео лол")
+        await event.respond(file=str(tmp_mp4), caption=f" {size_mb} MB")
         await reply.delete()
+
     except Exception as e:
-        await reply.edit(f" Ошибка: {e}")
+        await reply.edit(f"Ошибка: {e}")
     finally:
-        # Clean up
+        # Clean up only the temp video; keep images so you can inspect if needed.
         try:
             tmp_mp4.unlink(missing_ok=True)
         except Exception:
             pass
 
-@client.on(events.NewMessage(pattern=r"^/start$"))
-async def start(event):
-    if not chat_is_allowed(event):
-        return
-    await event.reply(
-        "Привет! Пришли ссылку на TikTok в ЛС — я верну видео файлом.\n"
-        "Бот отвечает только в приватных чатах."
-    )
+# ---------- Entrypoint ----------
 
 def main():
     print("Starting TikTok userbot (private-only)…")
